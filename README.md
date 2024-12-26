@@ -88,6 +88,10 @@ Execute o script:
 python telegram_downloader.py
 ```
 
+### 7. Parar o Download
+
+É possível parar o download usando a combinação de teclas `Ctrl + C`, mas não é possível retomar o download do ponto em que foi interrompido.
+
 ### Segurança
 
 Os dados de configuração, incluindo `api_id` e `api_hash`, são armazenados localmente no arquivo `config.json`. Certifique-se de que este arquivo está seguro e não compartilhe suas credenciais!
