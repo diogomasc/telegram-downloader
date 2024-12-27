@@ -4,6 +4,7 @@ import asyncio
 import signal
 from pyrogram import Client, enums
 from pyrogram.types import Message
+from pyrogram.errors import FileReferenceExpired
 import re
 from tqdm import tqdm
 import logging
@@ -27,7 +28,8 @@ class TelegramDownloader:
         self.client = None
         self.download_path = None
         self.should_stop = False
-        self.current_download = None
+        self.max_retries = 3
+        self.retry_delay = 5  # segundos
 
     async def initialize(self):
         """Inicializa o cliente do Telegram com as credenciais do usuário."""
@@ -53,7 +55,7 @@ class TelegramDownloader:
             return False
 
     def load_config(self):
-        """Carrega a configuração a partir do arquivo config.json."""
+        """Carrega a configuração do arquivo config.json."""
         if os.path.exists(self.config_file):
             with open(self.config_file, 'r') as f:
                 return json.load(f)
@@ -89,109 +91,50 @@ class TelegramDownloader:
 
     async def download_channel_files(self, channel_id: int):
         """Baixa todos os arquivos de um canal em ordem cronológica."""
-        self.download_path = input("Digite o nome da pasta para download: ")
-        os.makedirs(self.download_path, exist_ok=True)
-
         try:
-            # Obtém todas as mensagens e as ordena pela data
+            self.download_path = input("Digite o nome da pasta para download: ")
+            os.makedirs(self.download_path, exist_ok=True)
+            
+            print("Coletando informações dos arquivos...\n")
             messages = []
             async for message in self.client.get_chat_history(channel_id):
-                # Verifica se a mensagem contém qualquer tipo de mídia
                 if message.media:
                     messages.append(message)
 
-            # Ordena as mensagens pela data (do mais antigo para o mais recente)
-            messages.sort(key=lambda x: x.date)
-
-            # Baixa os arquivos com a numeração adequada
-            for counter, message in enumerate(messages, 1):
+            messages.reverse()  # Inverte para ordem cronológica
+            total_files = len(messages)
+            
+            print(f"Total de arquivos no canal: {total_files}\n")
+            
+            print("Iniciando downloads...")
+            for position, message in enumerate(messages, 1):
                 if self.should_stop:
                     break
 
-                file_name = self.generate_file_name(message, counter)
+                file_name = self.generate_file_name(message, position)
                 file_name = re.sub(r'[<>:"/\\|?*]', '_', file_name)
 
-                logger.info(f"Iniciando download {counter}/{len(messages)}: {file_name}")
-                await self.download_file(message, file_name)
+                print(f"\nBaixando arquivo {position}/{total_files}")
+                print(f"Nome: {file_name}")
+                
+                success = await self.download_file_with_retry(message, file_name)
+                
+                if success:
+                    print(f"Progresso: {position}/{total_files} arquivos baixados")
+                else:
+                    print(f"Falha ao baixar: {file_name}")
 
         except Exception as e:
             logger.error(f"Erro ao baixar arquivos do canal: {e}")
+            print(f"Erro durante o download: {str(e)}")
 
-    def generate_file_name(self, message: Message, counter: int) -> str:
-        """Gera um nome de arquivo com a numeração e formatação apropriada."""
-        # Tenta obter o nome original do arquivo
-        original_name = None
-        if message.document and message.document.file_name:
-            original_name = message.document.file_name
-
-        # Obtém a extensão do arquivo
-        ext = self.get_file_extension(message)
-
-        # Cria o nome base com o contador
-        base_name = f"{counter:03d}_"
-
-        # Se tiver texto na mensagem, usa como parte do nome do arquivo
-        if message.caption:
-            # Limpa e limita o tamanho do arquivo
-            clean_caption = re.sub(r'[<>:"/\\|?*\n]', '_', message.caption)
-            truncated_caption = clean_caption[:200]  # Limita o tamanho do arquivo
-            return f"{base_name}{truncated_caption}{ext}"
-
-        # Se tiver o nome original, usa com o prefixo do contador
-        if original_name:
-            return f"{base_name}{original_name}"
-
-        # Nome padrão
-        return f"{base_name}file{ext}"
-
-    def get_file_extension(self, message: Message) -> str:
-        """Obtém a extensão de arquivo apropriada com base no tipo de mensagem."""
-        
-        # Mapeamento de tipos MIME para extensões de arquivo
-        mime_map = {
-            'image/jpeg': '.jpg',
-            'image/png': '.png',
-            'image/gif': '.gif',
-            'image/webp': '.webp',
-            'image/bmp': '.bmp',
-            'application/zip': '.zip',
-            'application/x-rar-compressed': '.rar',
-            'application/x-7z-compressed': '.7z',
-            'video/mp4': '.mp4',
-            'audio/mpeg': '.mp3',
-            'audio/ogg': '.ogg'
-        }
-
-        def get_extension_from_mime(mime_type: str) -> str:
-            """Retorna a extensão de arquivo com base no tipo MIME."""
-            # Tenta obter a extensão do tipo MIME do mapa ou usa a função guess_extension
-            return mime_map.get(mime_type, mimetypes.guess_extension(mime_type) or '')
-
-        # Se não obter a extensão do tipo MIME, tenta pelo nome do arquivo
-        if message.document:
-            return get_extension_from_mime(message.document.mime_type) or os.path.splitext(message.document.file_name)[1]
-        
-        if message.video:
-            return '.mp4'
-        
-        if message.audio:
-            return '.mp3'
-        
-        if message.voice:
-            return '.ogg'
-        
-        if message.photo:
-            return '.jpg'
-        # Retorna uma string vazia se nenhum tipo de mídia for encontrado
-        return ''
-
-    async def download_file(self, message: Message, file_name: str):
-        """Baixa um único arquivo com barra de progresso e exibe a velocidade de download."""
+    async def download_file_with_retry(self, message: Message, file_name: str, retry_count=0):
+        """Tenta baixar um arquivo com suporte a retry em caso de erro de referência expirada."""
         try:
             path = os.path.join(self.download_path, file_name)
-
+            
             with tqdm(total=100, desc=f"Baixando {file_name}", unit="%") as progress:
-                start_time = time.time()  # Marca o tempo de início do download
+                start_time = time.time()
 
                 async def progress_callback(current, total):
                     if self.should_stop:
@@ -200,33 +143,99 @@ class TelegramDownloader:
                     progress.n = percent
                     progress.refresh()
 
-                    # Calcula a velocidade de download
                     elapsed_time = time.time() - start_time
                     if elapsed_time > 0:
                         speed_kb_s = (current / 1024) / elapsed_time
                         progress.set_postfix(velocidade=f"{speed_kb_s:.2f} KB/s")
 
-                await message.download(
-                    file_name=path,
-                    progress=progress_callback
-                )
+                # Obtém uma nova referência da mensagem antes de tentar o download
+                try:
+                    fresh_message = await self.client.get_messages(
+                        message.chat.id,
+                        message.id
+                    )
+
+                    if fresh_message is None:
+                        print(f"Não foi possível obter a mensagem: {message.id}")
+                        return False
+
+                    await fresh_message.download(
+                        file_name=path,
+                        progress=progress_callback
+                    )
+                    return True
+
+                except FileReferenceExpired:
+                    if retry_count < self.max_retries:
+                        print(f"\nReferência expirada, tentando novamente em {self.retry_delay} segundos...")
+                        await asyncio.sleep(self.retry_delay)
+                        return await self.download_file_with_retry(message, file_name, retry_count + 1)
+                    else:
+                        print(f"\nFalha após {self.max_retries} tentativas: {file_name}")
+                        return False
 
         except asyncio.CancelledError:
             if os.path.exists(path):
                 os.remove(path)
-            logger.info(f"Download cancelado: {file_name}")
+            print(f"\nDownload cancelado: {file_name}")
+            return False
+
         except Exception as e:
-            logger.error(f"Erro ao baixar {file_name}: {e}")
+            print(f"\nErro ao baixar {file_name}: {e}")
+            return False
+
+    def generate_file_name(self, message: Message, counter: int) -> str:
+        """Gera um nome de arquivo com a numeração e formatação apropriada."""
+        original_name = None
+        if message.document and message.document.file_name:
+            original_name = message.document.file_name
+
+        ext = self.get_file_extension(message)
+        base_name = f"{counter:03d}_"
+
+        if message.caption:
+            clean_caption = re.sub(r'[<>:"/\\|?*\n]', '_', message.caption)
+            truncated_caption = clean_caption[:200]
+            return f"{base_name}{truncated_caption}{ext}"
+
+        if original_name:
+            return f"{base_name}{original_name}"
+
+        return f"{base_name}file{ext}"
+
+    def get_file_extension(self, message: Message) -> str:
+        """Obtém a extensão de arquivo apropriada com base no tipo de mensagem."""
+        mime_map = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'video/mp4': '.mp4',
+            'audio/mpeg': '.mp3',
+            'audio/ogg': '.ogg'
+        }
+
+        if message.document:
+            mime_type = message.document.mime_type
+            return mime_map.get(mime_type, os.path.splitext(message.document.file_name)[1] or '')
+        elif message.video:
+            return '.mp4'
+        elif message.audio:
+            return '.mp3'
+        elif message.voice:
+            return '.ogg'
+        elif message.photo:
+            return '.jpg'
+        return ''
 
     def handle_interrupt(self):
         """Lida com a interrupção CTRL+C."""
         self.should_stop = True
         logger.info("\nInterrompendo downloads...")
+        print("\nDownload interrompido.")
 
 async def main():
     downloader = TelegramDownloader()
 
-    # Configura o manipulador de interrupção
     signal.signal(signal.SIGINT, lambda s, f: downloader.handle_interrupt())
 
     if not await downloader.initialize():
@@ -248,7 +257,6 @@ async def main():
                 await downloader.download_channel_files(int(channel_id))
             except ValueError:
                 print("ID de canal inválido!")
-
         elif choice == "3":
             await downloader.client.stop()
             break
