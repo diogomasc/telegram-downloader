@@ -85,7 +85,7 @@ Caso queira, antes de executar o script, configure suas credenciais do Telegram 
 Execute o script:
 
 ```bash
-python telegram_downloader.py
+python main.py
 ```
 
 ### 7. Parar o Download
